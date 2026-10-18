@@ -5,18 +5,27 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * BURSA - varianta GRESITA #1: DATA RACES si inconsistenta datelor.
  *
- * Structura e identica cu BursaCorecta, dar TOATA sincronizarea a fost scoasa.
+ * Structura e identica cu BursaCorecta (registru ConcurrentSkipListSet, matching pe oferta "agresor",
+ * oferta inserata inainte de matching), dar lock-urile pe oferte si pe traderi au fost scoase.
  * Erorile (marcate "BUG" in cod):
- *  BUG 1. Colectii nethread-safe (ArrayList) modificate si parcurse concurent
- *         -> ConcurrentModificationException, oferte pierdute, "Comparison method violates its general contract".
- *  BUG 2. match() ruleaza concurent pe aceeasi actiune: doua fire aleg aceeasi pereche de oferte
- *         si o executa de doua ori (double execution) -> se creeaza/distrug actiuni si bani.
- *  BUG 3. Read-modify-write neatomic: buyer.cash -= total, shares[i] += qty (lost update).
- *  BUG 4. Check-then-act in settle(): verifici fondurile, apoi (dupa un yield) le scazi -> cash/actiuni negative.
- *  BUG 5. Contoare partajate neatomice (orderSeq++, txSeq++) si campuri citite fara volatile/lock (lastPrice, active).
- *  BUG 6. modify(): if (o.active) ... apoi scrie => oferta poate fi executata intre test si scriere.
+ *  BUG 1. match() nu ia lock-urile celor doua oferte: doi agresori pot executa simultan aceeasi oferta
+ *         din registru (double execution) -> oferta e executata peste cantitatea ei (qty negativ).
+ *  BUG 2. Check-then-act pe "active": verifici ca oferta e activa, apoi (dupa un yield) o executi,
+ *         desi intre timp altcineva a executat-o / anulat-o.
+ *  BUG 3. settle() fara lock-urile traderilor: verifici fondurile, apoi le scazi (check-then-act),
+ *         iar buyer.cash -= total, shares[i] += qty sunt read-modify-write neatomice (lost update)
+ *         -> se creeaza/distrug bani si actiuni, apar valori negative.
+ *  BUG 4. b.qty -= n, s.qty -= n neatomice, fara lock.
+ *  BUG 5. Contoare partajate neatomice (orderSeq++, txSeq++). Doua oferte cu acelasi seq sunt "egale" pentru
+ *         comparator => ConcurrentSkipListSet.add() o refuza pe a doua: oferta se pierde fara urma.
+ *         lastPrice e un long simplu (fara volatile, fara "pastreaza tranzactia cea mai noua").
+ *  BUG 6. modify() schimba pretul IN LOC, cat timp oferta e inca in registru. Pretul e cheia de sortare
+ *         => registrul devine nesortat, remove() nu mai gaseste oferta (oferte "fantoma"), iar matching-ul
+ *         se opreste prea devreme si lasa oferte compatibile neexecutate.
+ *  BUG 7. Istoricul este un ArrayList nethread-safe -> tranzactii pierdute / exceptii.
  *
- * La final se verifica invariantele (cash total, actiuni totale, valori negative): vor fi incalcate.
+ * La final se verifica invariantele (cash total, actiuni totale, valori negative, oferte compatibile ramase,
+ * oferte executate peste cantitate, oferte pierdute): vor fi incalcate.
  * Compilare: javac BursaRace.java   |   Rulare: java BursaRace
  */
 public class BursaRace {
@@ -34,14 +43,18 @@ public class BursaRace {
     static long orderSeq = 0;                                   // BUG 5
     static long txSeq = 0;                                      // BUG 5
     static final AtomicInteger EXCEPTIONS = new AtomicInteger();
+    static final AtomicInteger OVERFILLS = new AtomicInteger();     // oferte executate peste cantitate (BUG 1/2/4)
+    static final AtomicInteger LOST_ORDERS = new AtomicInteger();   // oferte refuzate de registru (BUG 5)
+    static final AtomicInteger GHOSTS = new AtomicInteger();        // oferte pe care remove() nu le-a gasit (BUG 6)
 
     record Transaction(long id, String symbol, int qty, long price, int buyerId, int sellerId) {}
 
     static final class Order {
         final long seq = ++orderSeq;                            // BUG 5 (increment neatomic)
         final Stock stock; final Trader trader; final Side side;
-        long price; int qty;
-        boolean active = true;                                  // BUG 5 (fara volatile)
+        long price;                                             // BUG 6 (cheie de sortare modificabila)
+        int qty;                                                // BUG 4 (fara lock)
+        boolean active = true;                                  // BUG 2/5 (fara volatile, fara lock)
 
         Order(Stock stock, Trader trader, Side side, long price, int qty) {
             this.stock = stock; this.trader = trader; this.side = side; this.price = price; this.qty = qty;
@@ -57,7 +70,7 @@ public class BursaRace {
 
     static Result settle(Trader buyer, Trader seller, int stockIdx, int qty, long price) {
         long total = price * qty;
-        if (buyer.cash < total) return Result.BUYER_CANNOT_PAY;             // BUG 4: check ...
+        if (buyer.cash < total) return Result.BUYER_CANNOT_PAY;             // BUG 3: check ...
         if (seller.shares[stockIdx] < qty) return Result.SELLER_CANNOT_DELIVER;
         Thread.yield();                                                     // largeste fereastra de race
         buyer.cash -= total;                                                // BUG 3: ... then act, neatomic
@@ -74,79 +87,93 @@ public class BursaRace {
 
     static final class Stock {
         final int idx; final String symbol;
-        final List<Order> buys = new ArrayList<>();                         // BUG 1
-        final List<Order> sells = new ArrayList<>();                        // BUG 1
-        final List<Transaction> history = new ArrayList<>();                // BUG 1
+        final ConcurrentSkipListSet<Order> buys = new ConcurrentSkipListSet<>(BUY_FIRST);
+        final ConcurrentSkipListSet<Order> sells = new ConcurrentSkipListSet<>(SELL_FIRST);
+        final List<Transaction> history = new ArrayList<>();                // BUG 7
         long lastPrice = INITIAL_PRICE;                                     // BUG 5
 
         Stock(int idx, String symbol) { this.idx = idx; this.symbol = symbol; }
 
         Order place(Trader t, Side side, long price, int qty) {
             Order o = new Order(this, t, side, price, qty);
-            (side == Side.BUY ? buys : sells).add(o);                       // BUG 1
-            match();                                                        // BUG 2: fara lock
+            if (!book(side).add(o)) LOST_ORDERS.incrementAndGet();          // BUG 5: seq duplicat => oferta "egala" refuzata
+            match(o);
             return o;
         }
 
         boolean modify(Order o, long newPrice, int newQty) {
-            if (!o.active) return false;                                    // BUG 6: check ...
+            if (!o.active) return false;                                    // BUG 2: check ...
             Thread.yield();
-            o.price = newPrice;                                             // ... then act
+            o.price = newPrice;                                             // BUG 6: ... then act, cheia se schimba in registru
             o.qty = newQty;
-            match();
+            match(o);
             return true;
         }
 
         boolean cancel(Order o) {
             if (!o.active) return false;
-            remove(o);
+            deactivate(o);
             return true;
         }
 
         long[] bestBidAsk() {
-            long bid = 0, ask = 0;
-            for (Order o : buys) bid = Math.max(bid, o.price);              // BUG 1: iterare in timpul modificarilor
-            for (Order o : sells) ask = (ask == 0) ? o.price : Math.min(ask, o.price);
-            return new long[]{bid, ask};
+            Order b = first(buys), s = first(sells);
+            return new long[]{b == null ? 0 : b.price, s == null ? 0 : s.price};
         }
 
-        void remove(Order o) {
+        /** Oferte active, compatibile, de la traderi diferiti, ramase in registru (verificare finala). */
+        int crossingOrders() {
+            int count = 0;
+            for (Order b : buys) {
+                if (!b.active) continue;
+                for (Order s : sells)
+                    if (s.active && s.price <= b.price && s.trader != b.trader) { count++; break; }
+            }
+            return count;
+        }
+
+        private static Order first(ConcurrentSkipListSet<Order> set) {
+            try { return set.first(); } catch (NoSuchElementException e) { return null; }
+        }
+
+        private ConcurrentSkipListSet<Order> book(Side side) { return side == Side.BUY ? buys : sells; }
+
+        private void deactivate(Order o) {
             o.active = false;
-            (o.side == Side.BUY ? buys : sells).remove(o);
+            if (!book(o.side).remove(o)) GHOSTS.incrementAndGet();          // BUG 6: pretul schimbat => nu mai e gasita
         }
 
-        void match() {
-            while (true) {
-                buys.sort(BUY_FIRST);
-                sells.sort(SELL_FIRST);
-                Order b = null, s = null;
-                search:
-                for (Order bo : buys) {
-                    for (Order so : sells) {
-                        if (so.price > bo.price) break;
-                        if (so.trader != bo.trader) { b = bo; s = so; break search; }
-                    }
-                }
-                if (b == null) return;
+        private static boolean crosses(Order a, Order b) {
+            Order buy = a.side == Side.BUY ? a : b;
+            Order sell = (buy == a) ? b : a;
+            return sell.price <= buy.price;
+        }
 
+        private void match(Order o) {
+            for (Order c : book(o.side == Side.BUY ? Side.SELL : Side.BUY)) {
+                if (!o.active) return;
+                if (!crosses(o, c)) return;                                 // BUG 6: registrul poate fi nesortat
+                if (c.trader == o.trader) continue;
+                // BUG 1: lipseste lockPair(o, c)
+                if (!o.active || !c.active) continue;                       // BUG 2: check ...
+                Thread.yield();                                             //        (largeste fereastra)
+                Order b = o.side == Side.BUY ? o : c;
+                Order s = (b == o) ? c : o;
                 int n = Math.min(b.qty, s.qty);
-                if (n <= 0) {                                               // stare corupta de race: evitam bucla infinita
-                    if (b.qty <= 0) remove(b);
-                    if (s.qty <= 0) remove(s);
-                    continue;
-                }
+                if (n <= 0) continue;                                       // stare corupta de race: oferta deja consumata
                 long px = (b.seq < s.seq) ? b.price : s.price;
-                switch (settle(b.trader, s.trader, idx, n, px)) {
+                switch (settle(b.trader, s.trader, idx, n, px)) {           // ... then act
                     case OK -> {
-                        b.qty -= n;                                         // BUG 2/3: alt fir poate fi deja aici
+                        b.qty -= n;                                         // BUG 4: alt fir poate fi deja aici
                         s.qty -= n;
-                        lastPrice = px;
-                        history.add(new Transaction(++txSeq, symbol, n, px, b.trader.id, s.trader.id));
-                        if (b.qty <= 0) remove(b);
-                        if (s.qty <= 0) remove(s);
+                        if (b.qty < 0 || s.qty < 0) OVERFILLS.incrementAndGet();
+                        lastPrice = px;                                     // BUG 5
+                        history.add(new Transaction(++txSeq, symbol, n, px, b.trader.id, s.trader.id));   // BUG 5, 7
+                        if (b.qty <= 0) deactivate(b);
+                        if (s.qty <= 0) deactivate(s);
                     }
-                    case BUYER_CANNOT_PAY -> remove(b);
-                    case SELLER_CANNOT_DELIVER -> remove(s);
+                    case BUYER_CANNOT_PAY -> deactivate(b);
+                    case SELLER_CANNOT_DELIVER -> deactivate(s);
                 }
             }
         }
@@ -164,7 +191,7 @@ public class BursaRace {
             for (int i = 0; i < ITERATIONS; i++) {
                 try {
                     step();
-                } catch (RuntimeException e) {          // CME, IAE etc. provocate de race-uri
+                } catch (RuntimeException e) {          // exceptii provocate de race-uri (ex. ArrayList.add concurent)
                     EXCEPTIONS.incrementAndGet();
                 }
             }
@@ -224,10 +251,12 @@ public class BursaRace {
         }
         long ms = (System.nanoTime() - t0) / 1_000_000;
 
+        int historySize = 0;
+        for (Stock s : stocks) historySize += s.history.size();
         System.out.println("=== BursaRace (GRESITA: data races) ===");
-        System.out.printf("Timp: %d ms, txSeq=%d, tranzactii in istoric=%d, exceptii=%d%n",
-                ms, txSeq, stocks[0].history.size() + stocks[1].history.size() + stocks[2].history.size() + stocks[3].history.size(),
-                EXCEPTIONS.get());
+        System.out.printf("Timp: %d ms, txSeq=%d, tranzactii in istoric=%d, exceptii=%d%n", ms, txSeq, historySize, EXCEPTIONS.get());
+        System.out.printf("Oferte executate peste cantitate=%d, oferte pierdute (seq duplicat)=%d, oferte fantoma=%d%n",
+                OVERFILLS.get(), LOST_ORDERS.get(), GHOSTS.get());
 
         int violations = 0;
         long cashSum = 0;
@@ -249,6 +278,14 @@ public class BursaRace {
                 violations++;
                 System.out.printf("VIOLARE: total %s = %d (asteptat %d)%n", s.symbol, sum, (long) TRADERS * INITIAL_SHARES);
             }
+            int crossing = s.crossingOrders();
+            if (crossing > 0) { violations++; System.out.printf("VIOLARE: %d cereri compatibile neexecutate la %s%n", crossing, s.symbol); }
+        }
+        if (OVERFILLS.get() > 0) violations++;
+        if (LOST_ORDERS.get() > 0) violations++;
+        if (historySize != txSeq) {
+            violations++;
+            System.out.printf("VIOLARE: istoric are %d tranzactii, txSeq=%d%n", historySize, txSeq);
         }
         System.out.println(violations == 0 ? "Nicio violare observata in aceasta rulare (reruleaza; race-urile sunt nedeterministe)."
                                            : "Invarianta incalcata de " + violations + " ori => data race-uri confirmate.");

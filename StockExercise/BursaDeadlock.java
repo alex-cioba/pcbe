@@ -4,26 +4,32 @@ import java.lang.management.ThreadMXBean;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * BURSA - varianta GRESITA #2: DEADLOCK / LIVELOCK / PERFORMANTA.
- * Datele sunt protejate corect (nu apar data races), dar strategia de blocare e proasta.
- * Alegerea defectului se face din linia de comanda:
  *
- *   java BursaDeadlock deadlock   - lock(buyer) apoi lock(seller), in ordinea rolurilor din tranzactie.
- *                                   Firul 1: actiunea X, trader A cumpara de la B  -> ia A, asteapta B
- *                                   Firul 2: actiunea Y, trader B cumpara de la A  -> ia B, asteapta A  => DEADLOCK (asteptare circulara).
- *                                   Un watchdog (ThreadMXBean.findDeadlockedThreads) il detecteaza si il afiseaza.
+ * Structura e identica cu BursaCorecta (registru ConcurrentSkipListSet, cate un lock pe fiecare oferta,
+ * oferta inserata inainte de matching), datele sunt protejate corect (nu apar data races),
+ * dar strategia de luare a lock-urilor pe oferte e proasta. Alegerea defectului se face din linia de comanda:
  *
- *   java BursaDeadlock livelock   - evitam blocarea cu tryLock(): daca nu obtinem ambele lock-uri, le eliberam
- *                                   si reincercam IMEDIAT, fara backoff aleator. Firele raman active (consuma CPU,
+ *   java BursaDeadlock deadlock   - lockPair(o, c) ia lock-urile in ordinea ROLURILOR: intai oferta proprie (agresorul o),
+ *                                   apoi contrapartida c - nu in ordinea globala dupa seq.
+ *                                   Firul 1: cumparare X (agresor) gaseste vanzarea Y -> ia X, asteapta Y
+ *                                   Firul 2: vanzare  Y (agresor) gaseste cumpararea X -> ia Y, asteapta X  => DEADLOCK.
+ *                                   Ambele oferte sunt deja in registru (regula "insereaza, apoi cauta"), deci fiecare
+ *                                   o vede pe cealalta. Un watchdog (ThreadMXBean.findDeadlockedThreads) il detecteaza.
+ *
+ *   java BursaDeadlock livelock   - evitam blocarea cu tryLock(): daca nu obtinem ambele lock-uri de oferte, le eliberam
+ *                                   si reincercam IMEDIAT, simetric, fara backoff aleator. Firele raman active (consuma CPU,
  *                                   cresc contorul RETRIES) dar progresul (tranzactiile) poate stagna / incetini mult.
  *                                   Fenomen probabilistic: depinde de planificare; urmareste liniile [watchdog].
  *
- *   java BursaDeadlock slow       - corect, dar cu UN SINGUR lock global (synchronized(GLOBAL)) care acopera tot pasul unui
- *                                   trader, inclusiv "analiza" (50 µs). Toti traderii sunt serializati => fara paralelism.
+ *   java BursaDeadlock slow       - lock-uri pe oferte corecte (ordinea seq), dar UN SINGUR lock global (synchronized(GLOBAL))
+ *                                   acopera tot pasul unui trader, inclusiv "analiza" (50 µs). Toti traderii sunt serializati,
+ *                                   deci lock-urile fine pe oferte nu mai aduc niciun paralelism.
  *                                   Compara timpul cu BursaCorecta (aceeasi analiza, dar in afara lock-urilor).
  *
  * Compilare: javac BursaDeadlock.java
@@ -55,8 +61,10 @@ public class BursaDeadlock {
     static final class Order {
         final long seq = ORDER_SEQ.incrementAndGet();
         final Stock stock; final Trader trader; final Side side;
-        long price; int qty;
-        volatile boolean active = true;
+        final long price;                       // cheia de sortare in registru => nu se schimba niciodata
+        int qty;                                // protejat de lock
+        volatile boolean active = true;         // scris doar sub lock
+        final ReentrantLock lock = new ReentrantLock();
         Order(Stock stock, Trader trader, Side side, long price, int qty) {
             this.stock = stock; this.trader = trader; this.side = side; this.price = price; this.qty = qty;
         }
@@ -73,59 +81,60 @@ public class BursaDeadlock {
         int shares(int s) { lock.lock(); try { return shares[s]; } finally { lock.unlock(); } }
     }
 
-    /** Transferul propriu-zis; se apeleaza cu ambele lock-uri de trader luate. */
-    private static Result transfer(Trader buyer, Trader seller, int stockIdx, int qty, long price) {
-        long total = price * qty;
-        if (buyer.cash < total) return Result.BUYER_CANNOT_PAY;
-        if (seller.shares[stockIdx] < qty) return Result.SELLER_CANNOT_DELIVER;
-        buyer.cash -= total; buyer.shares[stockIdx] += qty;
-        seller.cash += total; seller.shares[stockIdx] -= qty;
-        return Result.OK;
+    /** Corect in toate modurile (ordinea id-urilor); defectele sunt la nivelul lock-urilor pe oferte. */
+    static Result settle(Trader buyer, Trader seller, int stockIdx, int qty, long price) {
+        Trader first = buyer.id < seller.id ? buyer : seller;
+        Trader second = (first == buyer) ? seller : buyer;
+        first.lock.lock();
+        try {
+            second.lock.lock();
+            try {
+                long total = price * qty;
+                if (buyer.cash < total) return Result.BUYER_CANNOT_PAY;
+                if (seller.shares[stockIdx] < qty) return Result.SELLER_CANNOT_DELIVER;
+                buyer.cash -= total; buyer.shares[stockIdx] += qty;
+                seller.cash += total; seller.shares[stockIdx] -= qty;
+                return Result.OK;
+            } finally {
+                second.lock.unlock();
+            }
+        } finally {
+            first.lock.unlock();
+        }
     }
 
-    static Result settle(Trader buyer, Trader seller, int stockIdx, int qty, long price) {
+    /** Ia lock-urile agresorului o si ale contrapartidei c; strategia depinde de MODE. */
+    static void lockPair(Order o, Order c) {
         switch (MODE) {
             case DEADLOCK: {
-                buyer.lock.lock();                                  // BUG: ordine dependenta de rolul din tranzactie, nu de o ordine globala
-                try {
-                    LockSupport.parkNanos(50_000);                  // lărgește fereastra (in viata reala: cod de validare, logging...)
-                    seller.lock.lock();
-                    try { return transfer(buyer, seller, stockIdx, qty, price); }
-                    finally { seller.lock.unlock(); }
-                } finally {
-                    buyer.lock.unlock();
-                }
+                o.lock.lock();                                      // BUG: intai oferta proprie, apoi contrapartida -
+                LockSupport.parkNanos(50_000);                      //      ordine data de rol, nu de seq (largim fereastra)
+                c.lock.lock();
+                return;
             }
             case LIVELOCK: {
                 while (true) {
-                    if (buyer.lock.tryLock()) {
-                        try {
-                            LockSupport.parkNanos(20_000);
-                            if (seller.lock.tryLock()) {
-                                try { return transfer(buyer, seller, stockIdx, qty, price); }
-                                finally { seller.lock.unlock(); }
-                            }
-                        } finally {
-                            buyer.lock.unlock();                    // renunta la tot ...
-                        }
+                    if (o.lock.tryLock()) {
+                        LockSupport.parkNanos(20_000);
+                        if (c.lock.tryLock()) return;
+                        o.lock.unlock();                            // renunta la tot ...
                     }
                     RETRIES.incrementAndGet();                      // BUG: ... si reincearca imediat, simetric, fara backoff aleator
                     Thread.yield();
                 }
             }
-            default: {                                              // SLOW: blocare corecta (ordonata); problema e altundeva
-                Trader first = buyer.id < seller.id ? buyer : seller;
-                Trader second = (first == buyer) ? seller : buyer;
+            default: {                                              // SLOW: ordinea globala dupa seq (corect); problema e altundeva
+                Order first = o.seq < c.seq ? o : c;
+                Order second = (first == o) ? c : o;
                 first.lock.lock();
-                try {
-                    second.lock.lock();
-                    try { return transfer(buyer, seller, stockIdx, qty, price); }
-                    finally { second.lock.unlock(); }
-                } finally {
-                    first.lock.unlock();
-                }
+                second.lock.lock();
             }
         }
+    }
+
+    static void unlockPair(Order a, Order b) {
+        a.lock.unlock();
+        b.lock.unlock();
     }
 
     static final Comparator<Order> BUY_FIRST =
@@ -135,72 +144,93 @@ public class BursaDeadlock {
 
     static final class Stock {
         final int idx; final String symbol;
-        final ReentrantLock lock = new ReentrantLock();
-        private final List<Order> buys = new ArrayList<>();
-        private final List<Order> sells = new ArrayList<>();
+        private final ConcurrentSkipListSet<Order> buys = new ConcurrentSkipListSet<>(BUY_FIRST);
+        private final ConcurrentSkipListSet<Order> sells = new ConcurrentSkipListSet<>(SELL_FIRST);
         final Queue<Transaction> history = new ConcurrentLinkedQueue<>();
-        volatile long lastPrice = INITIAL_PRICE;
+        private final AtomicReference<Transaction> lastTx;
 
-        Stock(int idx, String symbol) { this.idx = idx; this.symbol = symbol; }
+        Stock(int idx, String symbol) {
+            this.idx = idx; this.symbol = symbol;
+            this.lastTx = new AtomicReference<>(new Transaction(0, symbol, 0, INITIAL_PRICE, -1, -1));
+        }
+
+        long lastPrice() { return lastTx.get().price(); }
 
         Order place(Trader t, Side side, long price, int qty) {
             Order o = new Order(this, t, side, price, qty);
-            lock.lock();
-            try { (side == Side.BUY ? buys : sells).add(o); match(); }
-            finally { lock.unlock(); }
+            book(side).add(o);        // intai in registru, apoi cautam contrapartida
+            match(o);
             return o;
         }
 
-        boolean modify(Order o, long newPrice, int newQty) {
-            lock.lock();
+        /** Inlocuieste oferta; intoarce noua oferta sau null daca cea veche a fost deja executata complet / anulata. */
+        Order modify(Order o, long newPrice, int newQty) {
+            o.lock.lock();
             try {
-                if (!o.active) return false;
-                o.price = newPrice; o.qty = newQty;
-                match();
-                return true;
-            } finally { lock.unlock(); }
+                if (!o.active) return null;
+                deactivate(o);
+            } finally {
+                o.lock.unlock();
+            }
+            return place(o.trader, o.side, newPrice, newQty);
         }
 
         boolean cancel(Order o) {
-            lock.lock();
-            try { if (!o.active) return false; remove(o); return true; }
-            finally { lock.unlock(); }
+            o.lock.lock();
+            try {
+                if (!o.active) return false;
+                deactivate(o);
+                return true;
+            } finally {
+                o.lock.unlock();
+            }
         }
 
         long[] bestBidAsk() {
-            lock.lock();
-            try {
-                long bid = 0, ask = 0;
-                for (Order o : buys) bid = Math.max(bid, o.price);
-                for (Order o : sells) ask = (ask == 0) ? o.price : Math.min(ask, o.price);
-                return new long[]{bid, ask};
-            } finally { lock.unlock(); }
+            Order b = first(buys), s = first(sells);
+            return new long[]{b == null ? 0 : b.price, s == null ? 0 : s.price};
         }
 
-        private void remove(Order o) { o.active = false; (o.side == Side.BUY ? buys : sells).remove(o); }
+        private static Order first(ConcurrentSkipListSet<Order> set) {
+            try { return set.first(); } catch (NoSuchElementException e) { return null; }
+        }
 
-        private void match() {
-            while (true) {
-                buys.sort(BUY_FIRST); sells.sort(SELL_FIRST);
-                Order b = null, s = null;
-                search:
-                for (Order bo : buys)
-                    for (Order so : sells) {
-                        if (so.price > bo.price) break;
-                        if (so.trader != bo.trader) { b = bo; s = so; break search; }
+        private ConcurrentSkipListSet<Order> book(Side side) { return side == Side.BUY ? buys : sells; }
+
+        private void deactivate(Order o) { o.active = false; book(o.side).remove(o); }
+
+        private static boolean crosses(Order a, Order b) {
+            Order buy = a.side == Side.BUY ? a : b;
+            Order sell = (buy == a) ? b : a;
+            return sell.price <= buy.price;
+        }
+
+        private void match(Order o) {
+            for (Order c : book(o.side == Side.BUY ? Side.SELL : Side.BUY)) {
+                if (!o.active) return;
+                if (!crosses(o, c)) return;
+                if (c.trader == o.trader) continue;
+                lockPair(o, c);
+                try {
+                    if (!o.active || !c.active) continue;
+                    Order b = o.side == Side.BUY ? o : c;
+                    Order s = (b == o) ? c : o;
+                    int n = Math.min(b.qty, s.qty);
+                    long px = (b.seq < s.seq) ? b.price : s.price;
+                    switch (settle(b.trader, s.trader, idx, n, px)) {
+                        case OK -> {
+                            b.qty -= n; s.qty -= n;
+                            Transaction tx = new Transaction(TX_SEQ.incrementAndGet(), symbol, n, px, b.trader.id, s.trader.id);
+                            history.add(tx);
+                            lastTx.accumulateAndGet(tx, (x, y) -> x.id() > y.id() ? x : y);
+                            if (b.qty == 0) deactivate(b);
+                            if (s.qty == 0) deactivate(s);
+                        }
+                        case BUYER_CANNOT_PAY -> deactivate(b);
+                        case SELLER_CANNOT_DELIVER -> deactivate(s);
                     }
-                if (b == null) return;
-                int n = Math.min(b.qty, s.qty);
-                long px = (b.seq < s.seq) ? b.price : s.price;
-                switch (settle(b.trader, s.trader, idx, n, px)) {
-                    case OK -> {
-                        b.qty -= n; s.qty -= n; lastPrice = px;
-                        history.add(new Transaction(TX_SEQ.incrementAndGet(), symbol, n, px, b.trader.id, s.trader.id));
-                        if (b.qty == 0) remove(b);
-                        if (s.qty == 0) remove(s);
-                    }
-                    case BUYER_CANNOT_PAY -> remove(b);
-                    case SELLER_CANNOT_DELIVER -> remove(s);
+                } finally {
+                    unlockPair(o, c);
                 }
             }
         }
@@ -238,7 +268,7 @@ public class BursaDeadlock {
         private void placeOrder(Stock s, Side side) {
             int qty = 1 + rnd.nextInt(20);
             long[] bidAsk = s.bestBidAsk();
-            long price = s.lastPrice + rnd.nextInt(101) - 50;
+            long price = s.lastPrice() + rnd.nextInt(101) - 50;
             if (side == Side.BUY) {
                 if (bidAsk[1] > 0 && rnd.nextInt(3) == 0) price = bidAsk[1];
                 if (trader.cash() < price * qty) return;
@@ -253,7 +283,9 @@ public class BursaDeadlock {
             if (open.isEmpty()) return;
             int k = rnd.nextInt(open.size());
             Order o = open.get(k);
-            if (!o.stock.modify(o, o.stock.lastPrice + rnd.nextInt(101) - 50, 1 + rnd.nextInt(20))) open.remove(k);
+            Order replacement = o.stock.modify(o, o.stock.lastPrice() + rnd.nextInt(101) - 50, 1 + rnd.nextInt(20));
+            if (replacement == null) open.remove(k);
+            else open.set(k, replacement);
         }
 
         private void cancelRandom() {
